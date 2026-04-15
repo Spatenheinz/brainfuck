@@ -143,51 +143,94 @@ module InstructionTape = struct
 
 end
 
-module BrainfuckInterpreter = struct
+module type IO = sig
+  type t
+  type s
+  val init : s -> t
+  val read : t -> int option * t
+  val write : int -> t -> t
+end
 
-  let init program = (DataTape.init (), InstructionTape.init program)
+module RealIO : IO = struct
+  type t = unit
+  type s = unit
+  let init () = ()
+  let write value () =
+    Printf.printf "%d\n" value;
+    ()
+  let read () =
+    let input = read_line () in
+    int_of_string_opt input, ()
+end
 
-  let step (tape, program) =
-    let command = InstructionTape.read program in
-    if command = None then
-      raise (Failure "End of program reached")
-    else
-    let command = Option.get command in
-    let new_tape =
-      match command with
-        | '>' -> DataTape.move_right tape 
-        | '<' -> DataTape.move_left tape 
-        | '+' -> DataTape.increment tape 
-        | '-' -> DataTape.decrement tape
-        | '.' -> let value = DataTape.read tape in
-                 Printf.printf "%d\n" value;
-                 tape
-        | ',' -> let input = read_line () in
-                 let v = match int_of_string_opt input with
-                 | None -> print_endline "Invalid input, writing 0 to tape"; 0
-                 | Some value -> value
-                 in
-                 if v < 0 || v > 255 then
-                   (Printf.printf "Input out of range (0-255), writing 0 to tape\n"; DataTape.write tape 0)
-                 else
-                    DataTape.write tape v
-        | '?' -> let data_str = DataTape.print tape in
-                 Printf.printf "data: %s\n" data_str;
-                 let instr_str = InstructionTape.print_span program 10 in
-                 Printf.printf "instr: %s\n" instr_str;
-                 let _ = read_line() in tape
-        (* '[' and  ']' doenst modify tape so skip it  *)
-        | _ -> tape
-    in
-    let new_program =
-      if command = '[' && DataTape.read tape = 0 then
-        InstructionTape.jump_right program
-      else if command = ']' && DataTape.read tape <> 0 then
-        InstructionTape.jump_left program
-      else
-        InstructionTape.move_right program
-    in
-      (new_tape, new_program) 
+module TestIO : (IO with type s = int list) = struct
+  type t = {
+    inputs: int list;
+    outputs: int list;
+  }
+  type s = int list
+
+  let init inputs = { inputs = inputs; outputs = [] }
+
+  let read state =
+    match state.inputs with
+    | [] -> failwith "TestIO: No more input to read from"
+    | x :: rest ->
+        let value = if 0 <= x && x <= 255 then Some x else None in
+        value, { state with inputs = rest }
+  
+  let write v state = { state with outputs = v :: state.outputs }
+end
+
+type 'io exec_state =
+  | Running of DataTape.t * InstructionTape.t * 'io
+  | Halted of DataTape.t * InstructionTape.t * 'io
+
+module MakeBrainfuckInterpreter (IO: IO) = struct
+  type input_state = IO.s
+
+  let init prog state =
+    Running (DataTape.init (), InstructionTape.init prog, IO.init state)
+
+  let step = function
+    | Halted (_,_,_) as final -> final
+    | Running (tape, program, io) ->
+    match InstructionTape.read program with
+    | None -> Halted (tape, program, io)
+    | Some command ->
+      let (new_tape, next_io) =
+        match command with
+          | '>' -> DataTape.move_right tape, io
+          | '<' -> DataTape.move_left tape, io
+          | '+' -> DataTape.increment tape, io
+          | '-' -> DataTape.decrement tape, io
+          | ',' -> let (input, new_state) = IO.read io in
+                  let value = match input with
+                    | None -> print_endline "Invalid input, writing 0 to tape"; 0
+                    | Some v -> v
+                  in
+                  DataTape.write tape value,  new_state
+          | '.' -> let value = DataTape.read tape in
+                  let new_state = IO.write value io in
+                  tape, new_state
+          | '?' -> let data_str = DataTape.print tape in
+                  Printf.printf "data: %s\n" data_str;
+                  let instr_str = InstructionTape.print_span program 10 in
+                  Printf.printf "instr: %s\n" instr_str;
+                  let _ = read_line() in
+                  tape, io
+          (* '[' and  ']' doenst modify tape so skip it *)
+          | _ -> tape, io
+      in
+      let new_program =
+        if command = '[' && DataTape.read tape = 0 then
+          InstructionTape.jump_right program
+        else if command = ']' && DataTape.read tape <> 0 then
+          InstructionTape.jump_left program
+        else
+          InstructionTape.move_right program
+      in
+      Running (new_tape, new_program, next_io)
 
 end
 
@@ -198,83 +241,35 @@ let pprint (tape, program) =
   let instr_str = InstructionTape.print_span program 10 in
   Printf.printf "Instruction Tape: %s\n" instr_str;
 
-  (tape, program)
+module TestInterpreter = MakeBrainfuckInterpreter(TestIO)
 
-let run (tape, program) =
-  let rec go n (tape, program) =
+let run initial =
+  let rec go n state =
     Printf.printf "Step %d:\n" n;
-    let _ = pprint (tape, program) in
-    if InstructionTape.read program = None then
-      (tape, program)
-    else
-      BrainfuckInterpreter.step (tape, program) |> go (n + 1)
+    match TestInterpreter.step state with
+    | Halted (tape, program, io_state) ->
+       pprint (tape, program);
+       (tape, program, io_state)
+    | Running (tape, program, io_state) as s ->
+       pprint (tape,program);
+       go (n + 1) s
   in
-    go 0 (tape, program)
+    go 0 initial
 
 
 module Examples = struct
   let move = ",>>[-]<<[->>+<<]"
+  let max =
+    let init = "+>>>>,>," in
+    let count_smallest = "[-<[-<<]<<[>>]>+>>]" in
+    let count_largest = "<[-<+>]" in
+    let print = "<." in
+    String.concat "" [init; count_smallest; count_largest; print]
+  let max2 =
+    "+>>,>,[-<[-<]<[>]>>>+<]<[->>+<<]>>."
+  let max3 =
+    "+>>,>,[-<[-<]<?[+>]>>?]<[-<<+>>]<<-."
+  let max4 =
+    ",[->+>+<<]?,[->+>-<<]?>[->>+<-[<]]?"
+(* >>,>,[-<[-<]<+>[>]?>>]<[-<<+>>]<<. *)
 end
-
-module Max = struct
-  (* mem_layout *)
-  (*0 | 1 | a | a_1 | a_2 | underflow_flag | b_2 | b_1 | b *)
-  (* notice underflow flag will be 1 if not underflowed *)
-
-  (* a b a_1 b_1 a_2 b_2 0 1 *)
-  let read = ","
-  let init = read ^ ">" ^ read
-  let copy = "[->>+>>+<<<<]"
-  let zero_case = "+>+<"
-  (* let lop = "+[<[?-<]>>]" *)
-  (* r1 r2 r3 i1 i2 *)
-  (* +[>>>>[-<]<<]<[...] *)
-  let lop = ">>+[<<<<[->]>>]"
-  let x = ">[-<<<<<<.>>>>>>]>[-<<<<<.>>>>>]"
-  let program = String.concat "" [
-        init;
-        "<";
-        copy;
-        ">";
-        copy;
-        ">>>>>";
-        lop;
-        x;
-  ]
-
-  (* let move_ptr_a_to_b = ">>>>>>" *)
-  (* let move_ptr_b_to_a = "<<<<<<" *)
-
-  (* (\* after init *\) *)
-  (* (\* a | 0 | 0 | 0 | 0 | b *\) *)
-  (* let init = ">+>" ^ read ^ move_ptr_a_to_b ^ read *)
-
-  (* (\* assumes pointing to a *\) *)
-  (* let copy_a = "[->+>+<<]" *)
-
-  (* (\* assumes pointing to b *\) *)
-  (* let copy_b = "[-<+<+>>]" *)
-
-  (* let setup_loop = ">>>" *)
-
-  (* (\* if b = 0 then move back to a *\) *)
-  (* (\* else setp flag and move distance away from a *\) *)
-
-  (* let decrement_tmps = *)
-  (*   (\* while a != 0 *\) *)
-  (*   (\*   a-- *\) *)
-  (*   (\*   while --b != 0 *\) *)
-  (*   (\*     move_b *\) *)
-  (*   (\*  *\) *)
-  (*   "[<[->+>-[?<-<<<]<<]]" *)
-
-  (* let program = String.concat "" [ *)
-  (*       init; *)
-  (*       copy_b; *)
-  (*       move_ptr_b_to_a; *)
-  (*       copy_a; *)
-  (*       setup_loop; *)
-  (*       decrement_tmps; *)
-        
-  (* ] *)
-end 
